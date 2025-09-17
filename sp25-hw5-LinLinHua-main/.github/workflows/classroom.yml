@@ -1,0 +1,140 @@
+name: GitHub Classroom Workflow
+
+on: [push, pull_request]
+
+jobs:
+  setup:
+    name: Loading data
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.load.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: load
+        name: Load data
+        run: |
+             file_datetime=$(date --date="$(grep -P '^.+\d\d\d\d$' ScoresCodingTotal.txt | tail -1 )" +"%Y%m%d%H%M%S")
+             current_timestamp=$(date -d -30min +"%Y%m%d%H%M%S")
+
+             echo "Last grading: $file_datetime"
+             echo "Current time: $current_timestamp"
+
+             if [[ "$file_datetime" =~ ^[0-9]{14}$ && ! "$file_datetime" =~ ^[0-9]{8}000000$ ]]; then
+                 if [ "$current_timestamp" -le "$file_datetime" ]; then
+                     echo "You are submitting too frequently."
+                     echo "The auto grader does not work this way."
+                     echo "Please do not abuse it."
+                     echo "Ignore Submission."
+
+                     gh run cancel ${{ github.run_id }} --repo ${{ github.repository }} --confirm
+                     exit 1
+                 fi
+             fi
+             
+             # Read 'config.json' file
+             data=$(cat .github/workflows/config.json | tr '\n' ' ' | tr '\r' ' ')
+             
+             echo "matrix=$data" >> $GITHUB_OUTPUT
+
+  testing:
+    name: Grading Q${{ matrix.q_num }}
+    needs: setup
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    strategy:
+      matrix:
+        q_num: ${{ fromJSON(needs.setup.outputs.matrix).q_nums }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ fromJSON(needs.setup.outputs.matrix).grader_repo }}
+          path: 'coding_grader'
+
+      - name: Generate high-precision timestamp
+        run: echo "TIMESTAMP=$(date +%Y%m%d-%H%M%S-%3N)" >> $GITHUB_ENV
+
+      - name: Clear previous test result
+        if: always()
+        run: echo "" > Q${{ matrix.q_num }}res_.txt
+
+      - name: Test Q${{ matrix.q_num }}
+        if: always()
+        run: |
+             cp files/${{ matrix.q_num }}/q.cc coding_grader/${{ matrix.q_num }}/ || echo "No q.h found, skipping..."
+             
+             echo "--------- Student Test ---------"
+             bazel run --config=asan --enable_workspace --ui_event_filters=-info,-stdout,-stderr //files/${{ matrix.q_num }}:student_test
+             if [ $? -ne 0 ] ; then exit 1; fi
+
+             echo "--------- Grader Test ---------"
+             bazel run --config=asan --enable_workspace --ui_event_filters=-info,-stdout,-stderr //coding_grader/${{ matrix.q_num }}:grader_test 2>&1 | tee Q${{ matrix.q_num }}res.txt
+             
+             grep "OK" Q${{ matrix.q_num }}res.txt > Q${{ matrix.q_num }}res_.txt
+
+      - name: Delete existing artifact (if any)
+        run: |
+          ARTIFACT_NAME="Q${{ matrix.q_num }}res_.txt"
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
+
+          ARTIFACT_ID=$(echo "$RESPONSE" | jq -r --arg name "$ARTIFACT_NAME" '.artifacts | select(.!=null) | map(select(.name==$name)) | .[0].id // empty')
+
+          if [[ -n "$ARTIFACT_ID" && "$ARTIFACT_ID" != "null" ]]; then
+            echo "Deleting existing artifact: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
+            curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID"
+          else
+            echo "No existing artifact found with name: $ARTIFACT_NAME"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload result for Q${{ matrix.q_num }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Q${{ matrix.q_num }}res_.txt
+          path: Q${{ matrix.q_num }}res_.txt
+          retention-days: 1
+
+  collecting-result:
+    name: Collecting result
+    needs: [testing, setup]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: 'ee538/AutoGradingScript'
+          path: 'grading_script'
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ fromJSON(needs.setup.outputs.matrix).grader_repo }}
+          path: 'coding_grader'
+
+      - name: Download all subscore artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-subscores
+          
+      - name: Organize the total score (coding questions)
+        if: always()
+        run: |
+             mkdir -p grades
+
+             mv downloaded-subscores/*/* grades/
+             
+             python grading_script/coding_grades_total.py 2>&1 | tee ScoresCodingTotal.txt
+             
+             TZ='America/Los_Angeles' date >> ScoresCodingTotal.txt
+
+             rm -rf grades coding_grader
+             
+             git config --global user.email "ee538.autograder@gmail.com"
+             git config --global user.name "AutograderEE538"
+             git add ScoresCodingTotal.txt
+             git commit -m "Add autograding results"
+             git push origin HEAD:main -f
